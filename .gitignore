@@ -1,0 +1,33 @@
+# ── Rust ──────────────────────────────────────────────────────────────────────
+agent/target/
+**/*.rs.bk
+Cargo.lock
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ── Sensitive / Runtime state ─────────────────────────────────────────────────
+backend/events_db.json
+agent/ironclaw-state/
+**/identity.json
+**/policy.json
+**/spool/
+*.spool
+*.spool.tmp
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

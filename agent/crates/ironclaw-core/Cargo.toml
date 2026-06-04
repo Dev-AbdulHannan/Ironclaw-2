@@ -1,0 +1,22 @@
+[package]
+name = "ironclaw-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "IRONCLAW shared types: Config, Policy, Event, Identity, Error"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+log = { workspace = true }
+hostname = { workspace = true }
+sysinfo = { workspace = true }

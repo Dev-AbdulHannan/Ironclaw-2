@@ -1,0 +1,20 @@
+[package]
+name = "ironclaw-transport"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "IRONCLAW secure transport: HTTP client, disk buffer, event batcher"
+
+[dependencies]
+ironclaw-core = { path = "../ironclaw-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+zstd = { workspace = true }
+base64 = { workspace = true }

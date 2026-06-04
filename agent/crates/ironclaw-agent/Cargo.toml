@@ -1,0 +1,26 @@
+[package]
+name = "ironclaw-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "IRONCLAW Endpoint Agent main executable"
+
+[[bin]]
+name = "ironclaw-agent"
+path = "src/main.rs"
+
+[dependencies]
+ironclaw-core = { path = "../ironclaw-core" }
+ironclaw-collector = { path = "../ironclaw-collector" }
+ironclaw-transport = { path = "../ironclaw-transport" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+hostname = { workspace = true }

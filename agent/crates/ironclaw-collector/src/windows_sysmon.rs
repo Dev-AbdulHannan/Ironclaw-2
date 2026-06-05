@@ -4,8 +4,8 @@
 
 #![cfg(windows)]
 
+use crate::win_util::{get_latest_record_id, parse_event_xml, query_new_events};
 use crate::Collector;
-use crate::win_util::{get_latest_record_id, query_new_events, parse_event_xml};
 use ironclaw_core::{
     event::{Event, EventType},
     policy::Policy,
@@ -16,16 +16,20 @@ use tokio::sync::{mpsc::Sender, RwLock};
 pub struct SysmonCollector;
 
 impl SysmonCollector {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait::async_trait]
 impl Collector for SysmonCollector {
-    fn name(&self) -> &str { "windows_sysmon" }
+    fn name(&self) -> &str {
+        "windows_sysmon"
+    }
 
     async fn run(&self, tx: Sender<Event>, policy: Arc<RwLock<Policy>>) -> anyhow::Result<()> {
         log::info!("[sysmon] Starting Sysmon collector");
-        
+
         let channel = "Microsoft-Windows-Sysmon/Operational";
         let mut last_record_id = unsafe { get_latest_record_id(channel) };
         log::info!("[sysmon] Seeded last_record_id = {}", last_record_id);
@@ -34,10 +38,13 @@ impl Collector for SysmonCollector {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         loop {
             interval.tick().await;
-            
+
             let (ids, dll_enabled) = {
                 let pol = policy.read().await;
-                (pol.collection.sysmon_events.clone(), pol.collection.dll_events_enabled)
+                (
+                    pol.collection.sysmon_events.clone(),
+                    pol.collection.dll_events_enabled,
+                )
             };
 
             let mut active_ids = ids;
@@ -53,14 +60,19 @@ impl Collector for SysmonCollector {
             // OR-chains can silently fail on some Windows versions. We filter by
             // EventID in Rust after parsing.
             let xpath = format!("*[System[EventRecordID > {}]]", last_record_id);
-            log::info!("[sysmon] Querying with XPath: {} on channel {}", xpath, channel);
+            log::info!(
+                "[sysmon] Querying with XPath: {} on channel {}",
+                xpath,
+                channel
+            );
             let active_ids_clone = active_ids.clone();
 
             // Execute blocking Windows API call in spawn_blocking to avoid blocking tokio executor
             let xpath_clone = xpath.to_string();
-            let query_res = tokio::task::spawn_blocking(move || {
-                unsafe { query_new_events(channel, &xpath_clone) }
-            }).await;
+            let query_res = tokio::task::spawn_blocking(move || unsafe {
+                query_new_events(channel, &xpath_clone)
+            })
+            .await;
 
             match query_res {
                 Ok(Ok(xml_events)) => {
@@ -69,8 +81,15 @@ impl Collector for SysmonCollector {
                         log::info!("[sysmon] Found {} raw Sysmon XML events", xml_events.len());
                     }
                     for xml in xml_events {
-                        if let Some(event) = parse_event_xml(&xml, "windows-agent", EventType::Process, "sysmon") {
-                            log::info!("[sysmon] Parsed Sysmon event: ID={:?}, record_id={:?}, type={:?}", event.event_id, event.payload.get("event_record_id"), event.event_type);
+                        if let Some(event) =
+                            parse_event_xml(&xml, "windows-agent", EventType::Process, "sysmon")
+                        {
+                            log::info!(
+                                "[sysmon] Parsed Sysmon event: ID={:?}, record_id={:?}, type={:?}",
+                                event.event_id,
+                                event.payload.get("event_record_id"),
+                                event.event_type
+                            );
                             // Filter by the EventIDs enabled in the active policy
                             if let Some(eid) = event.event_id {
                                 if !active_ids_clone.contains(&eid) {
@@ -79,7 +98,9 @@ impl Collector for SysmonCollector {
                                     if let Some(payload_obj) = event.payload.as_object() {
                                         if let Some(rec_val) = payload_obj.get("event_record_id") {
                                             if let Some(rec_id) = rec_val.as_u64() {
-                                                if rec_id > last_record_id { last_record_id = rec_id; }
+                                                if rec_id > last_record_id {
+                                                    last_record_id = rec_id;
+                                                }
                                             }
                                         }
                                     }
@@ -102,7 +123,10 @@ impl Collector for SysmonCollector {
                                 return Ok(());
                             }
                         } else {
-                            log::info!("[sysmon] Failed to parse XML as Sysmon event. XML:\n{}", xml);
+                            log::info!(
+                                "[sysmon] Failed to parse XML as Sysmon event. XML:\n{}",
+                                xml
+                            );
                         }
                     }
                 }

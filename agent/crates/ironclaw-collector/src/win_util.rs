@@ -1,18 +1,23 @@
 #![cfg(windows)]
 
+use ironclaw_core::event::{Event, EventType};
 use windows::core::PCWSTR;
 use windows::Win32::System::EventLog::*;
-use ironclaw_core::event::{Event, EventType};
 
 pub fn to_utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub fn parse_event_xml(xml: &str, agent_id: &str, default_type: EventType, source: &str) -> Option<Event> {
+pub fn parse_event_xml(
+    xml: &str,
+    agent_id: &str,
+    default_type: EventType,
+    source: &str,
+) -> Option<Event> {
     // Extract EventID
     let id_start = xml.find("<EventID>")? + 9;
     let id_end = xml[id_start..].find("</EventID>")?;
-    let event_id: u32 = xml[id_start..id_start+id_end].parse().ok()?;
+    let event_id: u32 = xml[id_start..id_start + id_end].parse().ok()?;
 
     // Extract SystemTime (can be SystemTime="xxx" or SystemTime='xxx')
     let time_start = if let Some(pos) = xml.find("SystemTime=\"") {
@@ -24,36 +29,40 @@ pub fn parse_event_xml(xml: &str, agent_id: &str, default_type: EventType, sourc
     };
     let quote_char = xml.chars().nth(time_start - 1)?;
     let time_end = xml[time_start..].find(quote_char)?;
-    let timestamp = xml[time_start..time_start+time_end].to_string();
+    let timestamp = xml[time_start..time_start + time_end].to_string();
 
     // Extract EventRecordID (monotonically increasing ID per channel)
     let rec_start = xml.find("<EventRecordID>")? + 15;
     let rec_end = xml[rec_start..].find("</EventRecordID>")?;
-    let record_id: u64 = xml[rec_start..rec_start+rec_end].parse().ok()?;
+    let record_id: u64 = xml[rec_start..rec_start + rec_end].parse().ok()?;
 
     // Extract Computer
     let comp_start = xml.find("<Computer>")? + 10;
     let comp_end = xml[comp_start..].find("</Computer>")?;
-    let computer = xml[comp_start..comp_start+comp_end].to_string();
+    let computer = xml[comp_start..comp_start + comp_end].to_string();
 
     // Extract Data Name="xyz" fields (can be Name="xyz" or Name='xyz')
     let mut payload = serde_json::Map::new();
     let mut search_pos = 0;
     while search_pos < xml.len() {
-        let (data_pos, name_start, quote_char) = if let Some(pos) = xml[search_pos..].find("<Data Name=\"") {
-            (pos, search_pos + pos + 12, '"')
-        } else if let Some(pos) = xml[search_pos..].find("<Data Name='") {
-            (pos, search_pos + pos + 12, '\'')
-        } else {
-            break;
-        };
-        
+        let (_data_pos, name_start, quote_char) =
+            if let Some(pos) = xml[search_pos..].find("<Data Name=\"") {
+                (pos, search_pos + pos + 12, '"')
+            } else if let Some(pos) = xml[search_pos..].find("<Data Name='") {
+                (pos, search_pos + pos + 12, '\'')
+            } else {
+                break;
+            };
+
         if let Some(name_end) = xml[name_start..].find(quote_char) {
-            let name = &xml[name_start..name_start+name_end];
+            let name = &xml[name_start..name_start + name_end];
             let val_start = name_start + name_end + 2; // skip quote and '>'
             if let Some(val_end) = xml[val_start..].find("</Data>") {
-                let value = &xml[val_start..val_start+val_end];
-                payload.insert(name.to_string(), serde_json::Value::String(value.to_string()));
+                let value = &xml[val_start..val_start + val_end];
+                payload.insert(
+                    name.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
                 search_pos = val_start + val_end + 7;
             } else {
                 break;
@@ -64,30 +73,47 @@ pub fn parse_event_xml(xml: &str, agent_id: &str, default_type: EventType, sourc
     }
 
     // Include the Windows EventRecordID and system time in payload for tracking
-    payload.insert("event_record_id".to_string(), serde_json::Value::Number(record_id.into()));
+    payload.insert(
+        "event_record_id".to_string(),
+        serde_json::Value::Number(record_id.into()),
+    );
     payload.insert("computer".to_string(), serde_json::Value::String(computer));
-    payload.insert("system_time".to_string(), serde_json::Value::String(timestamp));
+    payload.insert(
+        "system_time".to_string(),
+        serde_json::Value::String(timestamp),
+    );
 
     // Determine specific EventType overrides
     let mut etype = default_type;
     if source == "sysmon" {
-        match event_id {
-            1 => etype = EventType::Process,
-            3 => etype = EventType::Network,
-            7 => etype = EventType::DriverLoad, // Image loaded (DLL load)
-            22 => etype = EventType::Dns,
-            11 => etype = EventType::FileSystem,
-            _ => {}
-        }
+        etype = match event_id {
+            1 | 5 => EventType::Process,
+            2 | 11 | 15 | 23 => EventType::FileSystem,
+            3 => EventType::Network,
+            6 => EventType::DriverLoad,
+            7 => EventType::ImageLoad,
+            8 => EventType::RemoteThread,
+            9 => EventType::RawDiskAccess,
+            10 => EventType::ProcessAccess,
+            12 | 13 => EventType::Registry,
+            17 | 18 => EventType::Pipe,
+            19 | 20 | 21 => EventType::WmiActivity,
+            22 => EventType::Dns,
+            24 => EventType::ClipboardAccess,
+            _ => default_type,
+        };
     }
 
-    Some(Event::new(agent_id, etype, source, Some(event_id), serde_json::Value::Object(payload)))
+    Some(Event::new(
+        agent_id,
+        etype,
+        source,
+        Some(event_id),
+        serde_json::Value::Object(payload),
+    ))
 }
 
-pub unsafe fn query_new_events(
-    channel: &str,
-    xpath_query: &str,
-) -> anyhow::Result<Vec<String>> {
+pub unsafe fn query_new_events(channel: &str, xpath_query: &str) -> anyhow::Result<Vec<String>> {
     let channel_w = to_utf16(channel);
     let xpath_w = to_utf16(xpath_query);
 
@@ -98,7 +124,13 @@ pub unsafe fn query_new_events(
         EvtQueryChannelPath.0 | EvtQueryForwardDirection.0,
     ) {
         Ok(h) => h,
-        Err(e) => return Err(anyhow::anyhow!("EvtQuery failed for channel '{}': {}", channel, e)),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "EvtQuery failed for channel '{}': {}",
+                channel,
+                e
+            ))
+        }
     };
 
     let mut event_handles = [0isize; 64];
@@ -120,11 +152,11 @@ pub unsafe fn query_new_events(
 
         for i in 0..returned as usize {
             let h_event = EVT_HANDLE(event_handles[i]);
-            
+
             // Render XML
             let mut buffer_used = 0;
             let mut property_count = 0;
-            
+
             let _ = EvtRender(
                 None,
                 h_event,
@@ -147,7 +179,7 @@ pub unsafe fn query_new_events(
                     &mut actual_used,
                     &mut property_count,
                 );
-                
+
                 if render_ok.is_ok() {
                     // Convert buffer to string, stripping null terminator at end
                     let end_idx = ((actual_used / 2) as usize).saturating_sub(1);
@@ -156,7 +188,7 @@ pub unsafe fn query_new_events(
                     }
                 }
             }
-            
+
             let _ = EvtClose(h_event);
         }
     }
@@ -168,7 +200,7 @@ pub unsafe fn query_new_events(
 pub unsafe fn get_latest_record_id(channel: &str) -> u64 {
     let channel_w = to_utf16(channel);
     let xpath_w = to_utf16("*");
-    
+
     let query_handle = match EvtQuery(
         None,
         PCWSTR::from_raw(channel_w.as_ptr()),
@@ -178,19 +210,13 @@ pub unsafe fn get_latest_record_id(channel: &str) -> u64 {
         Ok(h) => h,
         Err(_) => return 0,
     };
-    
+
     let mut event_handles = [0isize; 1];
     let mut returned = 0;
     let mut latest_id = 0;
-    
-    let success = EvtNext(
-        query_handle,
-        &mut event_handles,
-        500_u32,
-        0,
-        &mut returned,
-    );
-    
+
+    let success = EvtNext(query_handle, &mut event_handles, 500_u32, 0, &mut returned);
+
     if success.is_ok() && returned > 0 {
         let h_event = EVT_HANDLE(event_handles[0]);
         let mut buffer_used = 0;
@@ -222,7 +248,9 @@ pub unsafe fn get_latest_record_id(channel: &str) -> u64 {
                     if let Some(rec_start) = xml_str.find("<EventRecordID>") {
                         let rec_start = rec_start + 15;
                         if let Some(rec_end) = xml_str[rec_start..].find("</EventRecordID>") {
-                            if let Ok(record_id) = xml_str[rec_start..rec_start+rec_end].parse::<u64>() {
+                            if let Ok(record_id) =
+                                xml_str[rec_start..rec_start + rec_end].parse::<u64>()
+                            {
                                 latest_id = record_id;
                             }
                         }

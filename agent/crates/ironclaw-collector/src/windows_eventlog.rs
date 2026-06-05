@@ -3,8 +3,8 @@
 
 #![cfg(windows)]
 
+use crate::win_util::{get_latest_record_id, parse_event_xml, query_new_events};
 use crate::Collector;
-use crate::win_util::{get_latest_record_id, query_new_events, parse_event_xml};
 use ironclaw_core::{
     event::{Event, EventType},
     policy::Policy,
@@ -15,12 +15,16 @@ use tokio::sync::{mpsc::Sender, RwLock};
 pub struct SecurityLogCollector;
 
 impl SecurityLogCollector {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait::async_trait]
 impl Collector for SecurityLogCollector {
-    fn name(&self) -> &str { "windows_security_log" }
+    fn name(&self) -> &str {
+        "windows_security_log"
+    }
 
     async fn run(&self, tx: Sender<Event>, policy: Arc<RwLock<Policy>>) -> anyhow::Result<()> {
         log::info!("[security_log] Starting Security Event Log collector");
@@ -49,22 +53,27 @@ impl Collector for SecurityLogCollector {
             let enabled_ids_clone = enabled_ids.clone();
 
             let xpath_clone = xpath.to_string();
-            let query_res = tokio::task::spawn_blocking(move || {
-                unsafe { query_new_events(channel, &xpath_clone) }
-            }).await;
+            let query_res = tokio::task::spawn_blocking(move || unsafe {
+                query_new_events(channel, &xpath_clone)
+            })
+            .await;
 
             match query_res {
                 Ok(Ok(xml_events)) => {
                     has_warned = false;
                     for xml in xml_events {
-                        if let Some(event) = parse_event_xml(&xml, "windows-agent", EventType::Auth, "security_log") {
+                        if let Some(event) =
+                            parse_event_xml(&xml, "windows-agent", EventType::Auth, "security_log")
+                        {
                             // Filter by EventIDs enabled in the active policy
                             if let Some(eid) = event.event_id {
                                 if !enabled_ids_clone.contains(&eid) {
                                     if let Some(payload_obj) = event.payload.as_object() {
                                         if let Some(rec_val) = payload_obj.get("event_record_id") {
                                             if let Some(rec_id) = rec_val.as_u64() {
-                                                if rec_id > last_record_id { last_record_id = rec_id; }
+                                                if rec_id > last_record_id {
+                                                    last_record_id = rec_id;
+                                                }
                                             }
                                         }
                                     }

@@ -44,7 +44,7 @@ impl Event {
 }
 
 /// Categories matching the PDF telemetry sources.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
     /// Process creation/termination (Sysmon 1, 5)
@@ -53,16 +53,28 @@ pub enum EventType {
     Network,
     /// DNS query (Sysmon 22)
     Dns,
-    /// Driver/image load (Sysmon 7)
+    /// Kernel driver loaded (Sysmon 6) — feeds invariants.unsigned_drivers
     DriverLoad,
-    /// File system event (Sysmon 11/23)
+    /// Image/DLL loaded into a process (Sysmon 7)
+    ImageLoad,
+    /// File system event (Sysmon 2, 11, 15, 23)
     FileSystem,
     /// Authentication event (Security log 4624/4625)
     Auth,
     /// PowerShell script block (Event 4104)
     PowerShell,
-    /// Registry event (Sysmon 12/13)
+    /// Registry event (Sysmon 12, 13)
     Registry,
-    /// Pipe event (Sysmon 17/18)
+    /// Pipe event (Sysmon 17, 18)
     Pipe,
+    /// WMI activity events (Sysmon 19, 20, 21)
+    WmiActivity,
+    /// Clipboard change event (Sysmon 24)
+    ClipboardAccess,
+    /// Raw disk access event (Sysmon 9)
+    RawDiskAccess,
+    /// Process handle access (Sysmon 10) — feeds invariants.credential_dumping
+    ProcessAccess,
+    /// Remote thread injection (Sysmon 8)
+    RemoteThread,
 }

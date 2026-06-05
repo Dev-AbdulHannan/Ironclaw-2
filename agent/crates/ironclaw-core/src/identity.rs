@@ -14,6 +14,10 @@ use crate::policy::Policy;
 pub struct Identity {
     /// Permanent UUID assigned by HQ on registration.
     pub agent_id: String,
+    /// Fleet role/group this agent belongs to. Mutable via backend at heartbeat.
+    /// Existing identity.json files without this field deserialize as "default".
+    #[serde(default = "default_role")]
+    pub role: String,
     /// Base64-encoded Ed25519 private (signing) key.
     pub private_key_b64: String,
     /// Base64-encoded Ed25519 public key (sent to HQ during registration).
@@ -22,6 +26,34 @@ pub struct Identity {
     pub backend_public_key_b64: String,
     /// The policy that was active when this identity was last saved.
     pub policy: Policy,
+}
+
+/// Default role used when none is configured at enrollment time or in legacy
+/// identity.json files without the role field.
+pub fn default_role() -> String {
+    "default".to_string()
+}
+
+/// Validate a role string. Roles are restricted to ASCII alphanumerics, dash,
+/// and underscore, length 1..=64. This prevents the backend from pushing
+/// values that could be misinterpreted in logs, file paths, or future query strings.
+pub fn validate_role(role: &str) -> Result<(), String> {
+    if role.is_empty() {
+        return Err("role is empty".to_string());
+    }
+    if role.len() > 64 {
+        return Err(format!("role too long ({} chars, max 64)", role.len()));
+    }
+    if !role
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "role '{}' contains invalid characters (allowed: [A-Za-z0-9_-])",
+            role
+        ));
+    }
+    Ok(())
 }
 
 /// A freshly generated Ed25519 keypair (before enrollment).
@@ -73,6 +105,9 @@ pub struct RegisterRequest {
     pub public_key: String,
     pub os_version: String,
     pub agent_version: String,
+    /// Initial role assignment requested by the agent. Backend may override on
+    /// first heartbeat via `role_assignment`.
+    pub role: String,
 }
 
 /// OS metadata included in the registration request.

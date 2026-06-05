@@ -40,15 +40,15 @@ impl Collector for SimulatorCollector {
             interval.tick().await;
 
             let pol = policy.read().await;
-            
+
             let events: Vec<_> = {
                 // Create rng here so it's not held across await
                 let mut rng = rand::thread_rng();
                 let events_per_tick = rng.gen_range(1..=4_usize);
 
-                (0..events_per_tick).filter_map(|_| {
-                    generate_event(&pol, agent_id, &mut rng)
-                }).collect()
+                (0..events_per_tick)
+                    .filter_map(|_| generate_event(&pol, agent_id, &mut rng))
+                    .collect()
             }; // rng is dropped here
 
             for ev in events {
@@ -61,11 +61,7 @@ impl Collector for SimulatorCollector {
     }
 }
 
-fn generate_event(
-    policy: &Policy,
-    agent_id: &str,
-    rng: &mut impl Rng,
-) -> Option<Event> {
+fn generate_event(policy: &Policy, agent_id: &str, rng: &mut impl Rng) -> Option<Event> {
     // Choose event type based on policy settings
     let choices = build_choices(policy);
     if choices.is_empty() {

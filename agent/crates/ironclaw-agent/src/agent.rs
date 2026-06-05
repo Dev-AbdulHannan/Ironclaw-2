@@ -3,7 +3,7 @@
 use ironclaw_collector::{build_collectors, Collector};
 use ironclaw_core::config::Config;
 use ironclaw_core::event::Event;
-use ironclaw_core::identity::{self, Identity, RegisterRequest};
+use ironclaw_core::identity::{self, validate_role, Identity, RegisterRequest};
 use ironclaw_core::policy::Policy;
 use ironclaw_transport::buffer::EventBuffer;
 use ironclaw_transport::http::{HeartbeatRequest, HttpClient};
@@ -14,7 +14,12 @@ use tokio::time::{sleep, Duration, Instant};
 
 pub struct AgentApp {
     config: Config,
-    identity: Identity,
+    /// Immutable cached copy of the agent_id. Used on the hot event-tagging
+    /// path so we never need to take the identity lock per event.
+    agent_id: String,
+    /// Shared identity. The heartbeat task may rewrite `role` at runtime.
+    /// All other fields are effectively immutable after enrollment.
+    identity: Arc<RwLock<Identity>>,
     http_client: HttpClient,
     buffer: Arc<EventBuffer>,
     policy: Arc<RwLock<Policy>>,
@@ -27,10 +32,17 @@ impl AgentApp {
 
         // 1. Load or provision identity
         let identity = if let Some(id) = identity::load_identity(&config.paths.identity_path)? {
-            log::info!("Loaded existing identity for agent_id: {}", id.agent_id);
+            log::info!(
+                "Loaded existing identity for agent_id: {} (role: {})",
+                id.agent_id,
+                id.role
+            );
             id
         } else {
-            log::info!("No existing identity found. Registering...");
+            log::info!(
+                "No existing identity found. Registering as role '{}'...",
+                config.initial_role
+            );
             Self::enroll(&config, &http_client).await?
         };
 
@@ -51,17 +63,24 @@ impl AgentApp {
         let policy = Arc::new(RwLock::new(active_policy));
 
         // 3. Setup buffer
-        let buffer = Arc::new(EventBuffer::new(
-            config.buffer.memory_capacity,
-            config.paths.spool_dir.clone(),
-            config.buffer.spool_max_mb > 0,
-        ).await?);
+        let buffer = Arc::new(
+            EventBuffer::new(
+                config.buffer.memory_capacity,
+                config.paths.spool_dir.clone(),
+                config.buffer.spool_max_mb > 0,
+            )
+            .await?,
+        );
 
         // 4. Setup collectors
         let collectors = build_collectors();
 
+        let agent_id = identity.agent_id.clone();
+        let identity = Arc::new(RwLock::new(identity));
+
         Ok(Self {
             config,
+            agent_id,
             identity,
             http_client,
             buffer,
@@ -84,6 +103,7 @@ impl AgentApp {
             public_key: kp.public_key_b64.clone(),
             os_version,
             agent_version,
+            role: config.initial_role.clone(),
         };
 
         let mut backoff = config.backend.retry_delay_secs;
@@ -93,7 +113,11 @@ impl AgentApp {
                 Ok(r) => break r,
                 Err(e) => {
                     if retries >= config.backend.max_retries {
-                        return Err(anyhow::anyhow!("Registration failed after {} retries: {}", retries, e));
+                        return Err(anyhow::anyhow!(
+                            "Registration failed after {} retries: {}",
+                            retries,
+                            e
+                        ));
                     }
                     log::warn!("Registration failed: {}. Retrying in {}s...", e, backoff);
                     sleep(Duration::from_secs(backoff)).await;
@@ -105,6 +129,7 @@ impl AgentApp {
 
         let identity = Identity {
             agent_id: res.agent_id.clone(),
+            role: config.initial_role.clone(),
             private_key_b64: base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
                 kp.signing_key.as_bytes(),
@@ -115,28 +140,74 @@ impl AgentApp {
         };
 
         identity::save_identity(&identity, &config.paths.identity_path)?;
-        log::info!("Successfully registered as agent_id: {}", identity.agent_id);
+        log::info!(
+            "Successfully registered as agent_id: {} (role: {})",
+            identity.agent_id,
+            identity.role
+        );
         Ok(identity)
+    }
+
+    /// Apply a role assignment received from the backend.
+    ///
+    /// Returns `Ok(true)` when the role actually changed and was persisted,
+    /// `Ok(false)` when it was a no-op (same role, or backend sent the same
+    /// value we already have), and `Err(_)` for validation or persistence
+    /// failures. On persistence failure the in-memory role is reverted so
+    /// disk and memory stay consistent — next heartbeat will report the
+    /// pre-change role and the backend can re-issue the assignment.
+    async fn apply_role_change(
+        identity: &Arc<RwLock<Identity>>,
+        identity_path: &std::path::Path,
+        new_role: &str,
+    ) -> Result<bool, String> {
+        validate_role(new_role).map_err(|e| format!("backend sent invalid role: {}", e))?;
+
+        let mut id = identity.write().await;
+        if id.role == new_role {
+            return Ok(false);
+        }
+
+        let old_role = std::mem::replace(&mut id.role, new_role.to_string());
+
+        // Persist with the new role in place. save_identity does an atomic
+        // tmp+rename so a crash mid-write cannot leave a corrupt file.
+        match identity::save_identity(&id, identity_path) {
+            Ok(()) => {
+                log::warn!("[role] changed: '{}' -> '{}'", old_role, new_role);
+                Ok(true)
+            }
+            Err(e) => {
+                id.role = old_role.clone();
+                Err(format!(
+                    "persistence failed for role '{}' -> '{}': {}. Reverted in-memory.",
+                    old_role, new_role, e
+                ))
+            }
+        }
     }
 
     /// Evaluate detection filters from the policy against an event.
     /// Returns true if the event should be DROPPED (matched a "block" action).
-    fn apply_detection_filters(event: &Event, filters: &[ironclaw_core::policy::DetectionFilter]) -> bool {
+    fn apply_detection_filters(
+        event: &Event,
+        filters: &[ironclaw_core::policy::DetectionFilter],
+    ) -> bool {
         for filter in filters {
             let field_value = match filter.match_field.as_str() {
-                "cmdline" | "CommandLine" => {
-                    event.payload.get("CommandLine")
-                        .or_else(|| event.payload.get("cmdline"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_lowercase()
-                }
-                "image" | "Image" => {
-                    event.payload.get("Image")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_lowercase()
-                }
+                "cmdline" | "CommandLine" => event
+                    .payload
+                    .get("CommandLine")
+                    .or_else(|| event.payload.get("cmdline"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase(),
+                "image" | "Image" => event
+                    .payload
+                    .get("Image")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase(),
                 _ => String::new(),
             };
 
@@ -185,7 +256,9 @@ impl AgentApp {
 
         // Start heartbeat loop
         let hb_client = self.http_client.clone();
-        let hb_agent_id = self.identity.agent_id.clone();
+        let hb_agent_id = self.agent_id.clone();
+        let hb_identity = self.identity.clone();
+        let hb_identity_path = self.config.paths.identity_path.clone();
         let hb_pol = self.policy.clone();
         let hb_interval = self.config.backend.heartbeat_interval_secs;
         let hb_buffer = self.buffer.clone();
@@ -197,20 +270,87 @@ impl AgentApp {
             loop {
                 interval.tick().await;
                 let current_pol_ver = hb_pol.read().await.version;
+                let current_role = hb_identity.read().await.role.clone();
                 let req = HeartbeatRequest {
                     policy_version: current_pol_ver,
+                    role: current_role,
                     uptime_secs: uptime_start.elapsed().as_secs(),
                     buffer_depth: hb_buffer.memory_depth().await,
                     events_shipped: hb_shipped_counter.load(Ordering::Relaxed),
                 };
                 match hb_client.heartbeat(&hb_agent_id, &req).await {
                     Ok(res) => {
-                        log::info!("Heartbeat OK. Policy update available: {}", res.policy_update_available);
-                        if res.policy_update_available {
+                        log::info!(
+                            "Heartbeat OK. Policy update available: {}",
+                            res.policy_update.is_some()
+                        );
+
+                        // Apply role assignment FIRST (before the policy fetch
+                        // below), so the backend serves the correct policy on
+                        // the in-flight fetch. A role change also forces a
+                        // policy refresh even if the backend didn't send
+                        // a policy_update (defensive — the role's
+                        // policy may differ from the current one).
+                        let mut role_changed = false;
+                        if let Some(new_role) = res.role_assignment {
+                            match Self::apply_role_change(
+                                &hb_identity,
+                                &hb_identity_path,
+                                &new_role,
+                            )
+                            .await
+                            {
+                                Ok(true) => role_changed = true,
+                                Ok(false) => {} // unchanged or idempotent no-op
+                                Err(e) => log::error!("[role] {}", e),
+                            }
+                        }
+
+                        // Apply policy from heartbeat response if available
+                        if let Some(new_pol) = res.policy_update {
+                            log::info!(
+                                "Received new policy version {} via heartbeat",
+                                new_pol.version
+                            );
+                            if let Err(e) = new_pol.validate_hash() {
+                                log::error!("Policy hash validation failed: {}", e);
+                            } else {
+                                let mut p = hb_pol.write().await;
+                                // compute and log the diff before applying
+                                let diff = p.diff_summary(&new_pol);
+                                if diff.is_empty() {
+                                    log::info!(
+                                        "Policy v{} applied (no behavioral changes)",
+                                        new_pol.version
+                                    );
+                                } else {
+                                    for change in &diff {
+                                        log::info!("Policy change: {}", change);
+                                    }
+                                }
+                                *p = new_pol;
+                                p.enforce_invariants();
+                                // Phase 5: Policy persistence — atomic write
+                                if let Ok(json) = serde_json::to_string_pretty(&*p) {
+                                    let tmp = hb_policy_path.with_extension("tmp");
+                                    if std::fs::write(&tmp, json).is_ok() {
+                                        let _ = std::fs::rename(tmp, &hb_policy_path);
+                                    }
+                                }
+                                log::info!(
+                                    "Policy updated successfully to v{}",
+                                    p.version
+                                );
+                            }
+                        } else if role_changed {
+                            // If role changed but no policy in heartbeat, fall back to GET /policy
                             match hb_client.fetch_policy(&hb_agent_id, current_pol_ver).await {
                                 Ok(pol_res) => {
                                     if let Some(new_pol) = pol_res.policy {
-                                        log::info!("Received new policy version {}", new_pol.version);
+                                        log::info!(
+                                            "Received new policy version {} via GET /policy",
+                                            new_pol.version
+                                        );
                                         if let Err(e) = new_pol.validate_hash() {
                                             log::error!("Policy hash validation failed: {}", e);
                                         } else {
@@ -218,7 +358,10 @@ impl AgentApp {
                                             // compute and log the diff before applying
                                             let diff = p.diff_summary(&new_pol);
                                             if diff.is_empty() {
-                                                log::info!("Policy v{} applied (no behavioral changes)", new_pol.version);
+                                                log::info!(
+                                                    "Policy v{} applied (no behavioral changes)",
+                                                    new_pol.version
+                                                );
                                             } else {
                                                 for change in &diff {
                                                     log::info!("Policy change: {}", change);
@@ -233,7 +376,10 @@ impl AgentApp {
                                                     let _ = std::fs::rename(tmp, &hb_policy_path);
                                                 }
                                             }
-                                            log::info!("Policy updated successfully to v{}", p.version);
+                                            log::info!(
+                                                "Policy updated successfully to v{}",
+                                                p.version
+                                            );
                                         }
                                     }
                                 }
@@ -248,7 +394,7 @@ impl AgentApp {
 
         // Start shipper loop — respects rate limit from policy
         let ship_client = self.http_client.clone();
-        let ship_agent_id = self.identity.agent_id.clone();
+        let ship_agent_id = self.agent_id.clone();
         let ship_buffer = self.buffer.clone();
         let ship_pol = self.policy.clone();
         let batch_size = self.config.buffer.batch_size;
@@ -278,11 +424,16 @@ impl AgentApp {
                         // Enforce rate limit: only ship up to token budget
                         let allowed = (tokens as usize).min(batch.len());
                         if allowed == 0 {
-                            log::info!("[shipper] Rate limit reached, holding {} events", batch.len());
+                            log::info!(
+                                "[shipper] Rate limit reached, holding {} events",
+                                batch.len()
+                            );
                             let _ = ship_buffer.push_batch_back(batch).await;
                             continue;
                         }
-                        let (to_ship, remainder): (Vec<_>, Vec<_>) = batch.into_iter().enumerate()
+                        let (to_ship, remainder): (Vec<_>, Vec<_>) = batch
+                            .into_iter()
+                            .enumerate()
                             .partition(|(i, _)| *i < allowed);
                         let to_ship: Vec<Event> = to_ship.into_iter().map(|(_, e)| e).collect();
                         let remainder: Vec<Event> = remainder.into_iter().map(|(_, e)| e).collect();
@@ -295,13 +446,21 @@ impl AgentApp {
                         let count = to_ship.len();
                         match ironclaw_transport::batch::Batcher::compress_batch(&to_ship) {
                             Ok(compressed) => {
-                                if let Err(e) = ship_client.ship_events(&ship_agent_id, compressed).await {
-                                    log::error!("Shipping failed: {}, returning events to buffer", e);
+                                if let Err(e) =
+                                    ship_client.ship_events(&ship_agent_id, compressed).await
+                                {
+                                    log::error!(
+                                        "Shipping failed: {}, returning events to buffer",
+                                        e
+                                    );
                                     let _ = ship_buffer.push_batch_back(to_ship).await;
                                 } else {
                                     ship_shipped_counter.fetch_add(count as u64, Ordering::Relaxed);
-                                    log::info!("Shipped batch of {} events to backend (total shipped: {})",
-                                        count, ship_shipped_counter.load(Ordering::Relaxed));
+                                    log::info!(
+                                        "Shipped batch of {} events to backend (total shipped: {})",
+                                        count,
+                                        ship_shipped_counter.load(Ordering::Relaxed)
+                                    );
                                 }
                             }
                             Err(e) => log::error!("Compression failed: {}", e),
@@ -317,7 +476,8 @@ impl AgentApp {
             #[cfg(unix)]
             {
                 use tokio::signal::unix::{signal, SignalKind};
-                let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM");
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to register SIGTERM");
                 tokio::select! {
                     _ = sigterm.recv() => log::info!("[shutdown] SIGTERM received"),
                     _ = tokio::signal::ctrl_c() => log::info!("[shutdown] Ctrl-C received"),
@@ -336,7 +496,10 @@ impl AgentApp {
             // but we log the depth so the operator knows.
             let depth = shutdown_buffer.memory_depth().await;
             if depth > 0 {
-                log::warn!("[shutdown] {} in-memory events may be lost (not yet spooled to disk)", depth);
+                log::warn!(
+                    "[shutdown] {} in-memory events may be lost (not yet spooled to disk)",
+                    depth
+                );
             } else {
                 log::info!("[shutdown] Buffer clean. Exiting.");
             }
@@ -358,7 +521,7 @@ impl AgentApp {
             let _ = filters_snapshot; // used for debug if needed
 
             let mut ev = event;
-            ev.agent_id = self.identity.agent_id.clone();
+            ev.agent_id = self.agent_id.clone();
             if let Err(e) = self.buffer.push(ev).await {
                 log::error!("Failed to buffer event: {}", e);
             }

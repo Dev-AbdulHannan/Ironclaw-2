@@ -39,7 +39,7 @@ impl Policy {
     }
 
     /// Validate the policy hash. Returns error if hash doesn't match.
-    /// If the hash field is empty (backend didn't set it), validation passes — 
+    /// If the hash field is empty (backend didn't set it), validation passes —
     /// this is for backward compatibility with M1 default policies.
     pub fn validate_hash(&self) -> Result<(), String> {
         if self.hash.is_empty() {
@@ -47,6 +47,11 @@ impl Policy {
         }
         let computed = self.compute_hash();
         if computed != self.hash {
+            // Log the canonical JSON for debugging backend hash computation
+            let mut copy = self.clone();
+            copy.hash = String::new();
+            let canonical = serde_json::to_string(&copy).unwrap_or_default();
+            log::error!("[hash validation] Canonical JSON being hashed: {}", canonical);
             return Err(format!(
                 "Policy hash mismatch: received '{}', computed '{}'",
                 self.hash, computed
@@ -137,21 +142,28 @@ pub struct InvariantRule {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PolicyCollection {
     /// Sysmon event IDs to collect (e.g. [1,3,7,8,10,11,12,13,22,23])
+    #[serde(default)]
     pub sysmon_events: Vec<u32>,
     /// Windows Security event IDs to collect (e.g. [4624,4625,4672,4688,4720])
+    #[serde(default)]
     pub security_events: Vec<u32>,
     /// Enable PowerShell script block logging collection
+    #[serde(default)]
     pub powershell_logging: bool,
     /// Enable DLL load event collection (Sysmon event 7)
+    #[serde(default)]
     pub dll_events_enabled: bool,
     /// File event collection settings
+    #[serde(default)]
     pub file_events: FileEventsConfig,
 }
 
 impl Default for PolicyCollection {
     fn default() -> Self {
         Self {
-            sysmon_events: vec![1, 3, 7, 8, 10, 11, 12, 13, 22, 23],
+            sysmon_events: vec![
+                1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 24,
+            ],
             security_events: vec![4624, 4625, 4672, 4688, 4720],
             powershell_logging: true,
             dll_events_enabled: false,

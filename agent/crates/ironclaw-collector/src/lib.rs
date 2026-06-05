@@ -6,13 +6,13 @@
 pub mod simulator;
 
 #[cfg(windows)]
-pub mod windows_eventlog;
+pub mod win_util;
 #[cfg(windows)]
-pub mod windows_sysmon;
+pub mod windows_eventlog;
 #[cfg(windows)]
 pub mod windows_powershell;
 #[cfg(windows)]
-pub mod win_util;
+pub mod windows_sysmon;
 
 use ironclaw_core::{event::Event, policy::Policy};
 use std::sync::Arc;

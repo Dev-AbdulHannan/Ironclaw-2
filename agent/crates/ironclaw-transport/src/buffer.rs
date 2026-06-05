@@ -2,7 +2,7 @@
 
 use ironclaw_core::event::Event;
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -16,7 +16,11 @@ pub struct EventBuffer {
 }
 
 impl EventBuffer {
-    pub async fn new(capacity: usize, spool_dir: PathBuf, disk_spool_enabled: bool) -> anyhow::Result<Self> {
+    pub async fn new(
+        capacity: usize,
+        spool_dir: PathBuf,
+        disk_spool_enabled: bool,
+    ) -> anyhow::Result<Self> {
         if disk_spool_enabled {
             fs::create_dir_all(&spool_dir).await?;
         }
@@ -33,10 +37,12 @@ impl EventBuffer {
         let mut mem = self.memory_buffer.lock().await;
         if mem.len() >= self.capacity {
             if self.disk_spool_enabled {
-                // Spool to disk
                 self.spool_to_disk(&event).await?;
             } else {
-                // Drop oldest if no disk spool
+                log::warn!(
+                    "[buffer] memory full ({} events) and disk spool disabled — dropping oldest",
+                    mem.len()
+                );
                 mem.pop_front();
                 mem.push_back(event);
             }
@@ -98,14 +104,18 @@ impl EventBuffer {
         Ok(())
     }
 
-    async fn load_from_disk(&self, batch: &mut Vec<Event>, batch_size: usize) -> anyhow::Result<()> {
+    async fn load_from_disk(
+        &self,
+        batch: &mut Vec<Event>,
+        batch_size: usize,
+    ) -> anyhow::Result<()> {
         let file_path = self.spool_dir.join("current.spool");
         if !file_path.exists() {
             return Ok(());
         }
 
         let file = File::open(&file_path).await?;
-        let mut reader = BufReader::new(file);
+        let reader = BufReader::new(file);
         let mut lines = reader.lines();
 
         let mut remaining_lines = Vec::new();

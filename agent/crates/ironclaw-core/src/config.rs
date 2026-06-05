@@ -2,6 +2,7 @@
 //! This is the startup config (paths, URLs, intervals).
 //! Runtime behavior is controlled by Policy (received from HQ).
 
+use crate::identity::{default_role, validate_role};
 use std::path::PathBuf;
 
 /// Full agent startup configuration.
@@ -10,6 +11,10 @@ pub struct Config {
     pub backend: BackendConfig,
     pub paths: PathsConfig,
     pub buffer: BufferConfig,
+    /// Initial role used only at first enrollment. After enrollment the role
+    /// is persisted in identity.json and the env var is ignored on subsequent
+    /// starts (backend remains the authoritative source).
+    pub initial_role: String,
 }
 
 impl Config {
@@ -19,7 +24,26 @@ impl Config {
             backend: BackendConfig::from_env(),
             paths: PathsConfig::from_env(),
             buffer: BufferConfig::from_env(),
+            initial_role: load_initial_role(),
         }
+    }
+}
+
+fn load_initial_role() -> String {
+    match std::env::var("IRONCLAW_ROLE") {
+        Ok(v) => match validate_role(&v) {
+            Ok(()) => v,
+            Err(e) => {
+                log::warn!(
+                    "IRONCLAW_ROLE='{}' invalid ({}). Falling back to '{}'.",
+                    v,
+                    e,
+                    default_role()
+                );
+                default_role()
+            }
+        },
+        Err(_) => default_role(),
     }
 }
 
@@ -124,7 +148,8 @@ pub struct BufferConfig {
     pub batch_size: usize,
     /// Max seconds before sending a partial batch
     pub batch_timeout_secs: u64,
-    /// Maximum disk spool size in MB (0 = unlimited)
+    /// Disk spool toggle and (future) cap. Currently: > 0 enables disk overflow,
+    /// 0 disables. Size limit itself is not yet enforced.
     pub spool_max_mb: u64,
 }
 

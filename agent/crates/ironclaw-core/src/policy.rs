@@ -141,33 +141,44 @@ pub struct InvariantRule {
 /// Telemetry collection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PolicyCollection {
-    /// Sysmon event IDs to collect (e.g. [1,3,7,8,10,11,12,13,22,23])
+    /// Sysmon event IDs to collect (e.g. [1,3,7,8,10,11,12,13,22,23,25,26])
     #[serde(default)]
     pub sysmon_events: Vec<u32>,
-    /// Windows Security event IDs to collect (e.g. [4624,4625,4672,4688,4720])
+    /// Windows Security event IDs to collect.
     #[serde(default)]
     pub security_events: Vec<u32>,
-    /// Enable PowerShell script block logging collection
+    /// Enable PowerShell script block logging collection.
     #[serde(default)]
     pub powershell_logging: bool,
-    /// Enable DLL load event collection (Sysmon event 7)
+    /// Enable DLL load event collection (Sysmon event 7).
     #[serde(default)]
     pub dll_events_enabled: bool,
-    /// File event collection settings
+    /// File event collection settings.
     #[serde(default)]
     pub file_events: FileEventsConfig,
+    /// Registry event filtering (Sysmon events 12, 13, 14).
+    /// Skipped during serialization when both lists are empty so the agent's
+    /// hash matches a backend that doesn't emit this block at all.
+    #[serde(default, skip_serializing_if = "RegistryKeysConfig::is_empty")]
+    pub registry_keys: RegistryKeysConfig,
 }
 
 impl Default for PolicyCollection {
     fn default() -> Self {
         Self {
+            // Sysmon event IDs aligned with §4.2.2 of the agent specification.
+            // Excludes ID 24 (Clipboard) per spec — privacy-restricted.
             sysmon_events: vec![
-                1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 24,
+                1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 25, 26,
             ],
-            security_events: vec![4624, 4625, 4672, 4688, 4720],
+            // Security event IDs aligned with §4.2.3 of the agent specification.
+            security_events: vec![
+                4624, 4625, 4634, 4648, 4656, 4657, 4663, 4672, 4688, 4697, 4698, 4720, 4732,
+            ],
             powershell_logging: true,
             dll_events_enabled: false,
             file_events: FileEventsConfig::default(),
+            registry_keys: RegistryKeysConfig::default(),
         }
     }
 }
@@ -175,15 +186,55 @@ impl Default for PolicyCollection {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileEventsConfig {
     pub enabled: bool,
+    /// Glob patterns (Windows path style). If non-empty, only file events whose
+    /// path matches one of these are kept.
+    ///
+    /// Wire name `path_filters` is preserved so the serialized policy round-trips
+    /// to the exact same bytes the backend used to compute the policy hash.
+    /// `include` is accepted as a forward-compat alias for when the backend
+    /// migrates to the spec's naming.
+    #[serde(default, alias = "include")]
     pub path_filters: Vec<String>,
+    /// Glob patterns. File events whose path matches any of these are dropped
+    /// (applied after `path_filters`). Skipped on serialize when empty so the
+    /// agent's hash matches a backend that doesn't send this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
 }
 
 impl Default for FileEventsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            path_filters: vec!["C:\\Windows\\Temp\\*".to_string()],
+            path_filters: vec![
+                "C:\\Users\\*\\Downloads\\*".to_string(),
+                "C:\\Users\\*\\AppData\\*".to_string(),
+                "C:\\Windows\\Temp\\*".to_string(),
+            ],
+            exclude: vec!["C:\\Windows\\Prefetch\\*".to_string()],
         }
+    }
+}
+
+/// Registry key filtering applied to Sysmon events 12, 13, 14.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RegistryKeysConfig {
+    /// Glob patterns. If non-empty, only registry events whose key path matches
+    /// one of these are kept. Skipped on serialize when empty for hash parity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    /// Glob patterns. Registry events whose key path matches any of these are
+    /// dropped (applied after `include`). Skipped on serialize when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
+
+impl RegistryKeysConfig {
+    /// True when the block carries no filters — used by `skip_serializing_if`
+    /// so an empty `registry_keys` block disappears entirely from the wire
+    /// (matching backends that don't emit it at all).
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
     }
 }
 

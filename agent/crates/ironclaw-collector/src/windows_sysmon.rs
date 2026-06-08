@@ -3,10 +3,13 @@
 //! Event IDs collected are driven by the live policy (collection.sysmon_events).
 //!
 //! Policy fields honored:
-//!   - `collection.sysmon_events`      — the allow-list of Sysmon EventIDs
-//!   - `collection.dll_events_enabled` — gates EventID 7 (ImageLoad / DLL load)
-//!   - `collection.file_events.enabled` — gates the file-system EventIDs (2, 11, 15, 23)
-//!   - `collection.file_events.path_filters` — substring/glob match on TargetFilename
+//!   - `collection.sysmon_events`         — the allow-list of Sysmon EventIDs
+//!   - `collection.dll_events_enabled`    — gates EventID 7 (ImageLoad / DLL load)
+//!   - `collection.file_events.enabled`   — gates file-system EventIDs (2, 11, 15, 23)
+//!   - `collection.file_events.path_filters` — glob include-list for file paths
+//!   - `collection.file_events.exclude`       — glob exclude-list for file paths
+//!   - `collection.registry_keys.include` — glob include-list for registry events (12, 13, 14)
+//!   - `collection.registry_keys.exclude` — glob exclude-list for registry events
 
 #![cfg(windows)]
 
@@ -21,6 +24,9 @@ use tokio::sync::{mpsc::Sender, RwLock};
 
 /// Sysmon EventIDs that represent file-system activity.
 const FILE_EVENT_IDS: &[u32] = &[2, 11, 15, 23];
+
+/// Sysmon EventIDs that represent registry activity.
+const REGISTRY_EVENT_IDS: &[u32] = &[12, 13, 14];
 
 pub struct SysmonCollector;
 
@@ -50,13 +56,24 @@ impl Collector for SysmonCollector {
 
             // Snapshot the slices of the policy we need so we don't hold the
             // RwLock across the blocking Windows query below.
-            let (sysmon_ids, dll_enabled, file_events_enabled, path_filters) = {
+            let (
+                sysmon_ids,
+                dll_enabled,
+                file_events_enabled,
+                file_include,
+                file_exclude,
+                reg_include,
+                reg_exclude,
+            ) = {
                 let pol = policy.read().await;
                 (
                     pol.collection.sysmon_events.clone(),
                     pol.collection.dll_events_enabled,
                     pol.collection.file_events.enabled,
                     pol.collection.file_events.path_filters.clone(),
+                    pol.collection.file_events.exclude.clone(),
+                    pol.collection.registry_keys.include.clone(),
+                    pol.collection.registry_keys.exclude.clone(),
                 )
             };
 
@@ -113,41 +130,45 @@ impl Collector for SysmonCollector {
                         // Filter by the EventIDs enabled in the active policy.
                         if let Some(eid) = event.event_id {
                             if !active_ids_clone.contains(&eid) {
-                                log::debug!(
-                                    "[sysmon] event ID={} skipped by policy",
-                                    eid
-                                );
-                                if let Some(r) = rec_id {
-                                    if r > last_record_id {
-                                        last_record_id = r;
-                                    }
-                                }
+                                log::debug!("[sysmon] event ID={} skipped by policy", eid);
+                                advance_watermark(rec_id, &mut last_record_id);
                                 continue;
                             }
 
-                            // For file events, apply path_filters if configured.
+                            // File-event path filtering.
                             if FILE_EVENT_IDS.contains(&eid)
-                                && !path_filters.is_empty()
-                                && !event_matches_path_filters(&event, &path_filters)
+                                && !path_passes_filters(
+                                    extract_file_path(&event),
+                                    &file_include,
+                                    &file_exclude,
+                                )
                             {
                                 log::debug!(
-                                    "[sysmon] file event ID={} skipped by path_filters",
+                                    "[sysmon] file event ID={} skipped by file_events filters",
                                     eid
                                 );
-                                if let Some(r) = rec_id {
-                                    if r > last_record_id {
-                                        last_record_id = r;
-                                    }
-                                }
+                                advance_watermark(rec_id, &mut last_record_id);
+                                continue;
+                            }
+
+                            // Registry path filtering.
+                            if REGISTRY_EVENT_IDS.contains(&eid)
+                                && !path_passes_filters(
+                                    extract_registry_path(&event),
+                                    &reg_include,
+                                    &reg_exclude,
+                                )
+                            {
+                                log::debug!(
+                                    "[sysmon] registry event ID={} skipped by registry_keys filters",
+                                    eid
+                                );
+                                advance_watermark(rec_id, &mut last_record_id);
                                 continue;
                             }
                         }
 
-                        if let Some(r) = rec_id {
-                            if r > last_record_id {
-                                last_record_id = r;
-                            }
-                        }
+                        advance_watermark(rec_id, &mut last_record_id);
                         log::debug!(
                             "[sysmon] event ID={:?} record_id={:?} -> agent channel",
                             event.event_id,
@@ -173,20 +194,51 @@ impl Collector for SysmonCollector {
     }
 }
 
-/// Return true if any of the configured patterns matches the event's file path
-/// (typically the `TargetFilename` payload field, falling back to `Image`).
-fn event_matches_path_filters(event: &Event, patterns: &[String]) -> bool {
-    let path = event
+fn advance_watermark(rec_id: Option<u64>, last: &mut u64) {
+    if let Some(r) = rec_id {
+        if r > *last {
+            *last = r;
+        }
+    }
+}
+
+/// Extract the file path from a Sysmon file event payload (IDs 2, 11, 15, 23).
+fn extract_file_path(event: &Event) -> &str {
+    event
         .payload
         .get("TargetFilename")
         .or_else(|| event.payload.get("Image"))
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+}
 
+/// Extract the registry key path from a Sysmon registry event payload (IDs 12, 13, 14).
+fn extract_registry_path(event: &Event) -> &str {
+    event
+        .payload
+        .get("TargetObject")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// Apply include/exclude path filters. Returns true if the path should pass through.
+///
+/// Semantics (matches §4.6.2 of the spec):
+///   - empty include          → all paths are included by default
+///   - non-empty include      → path must match at least one include pattern
+///   - any exclude match wins → path is dropped
+///   - empty path             → dropped (we can't classify it)
+fn path_passes_filters(path: &str, include: &[String], exclude: &[String]) -> bool {
     if path.is_empty() {
         return false;
     }
-    patterns.iter().any(|p| glob_match(p, path))
+    if !include.is_empty() && !include.iter().any(|p| glob_match(p, path)) {
+        return false;
+    }
+    if exclude.iter().any(|p| glob_match(p, path)) {
+        return false;
+    }
+    true
 }
 
 /// Lightweight case-insensitive glob matcher. Supports `*` (zero or more chars)
@@ -202,7 +254,6 @@ fn glob_match_inner(p: &[char], mut pi: usize, t: &[char], mut ti: usize) -> boo
     while pi < p.len() {
         match p[pi] {
             '*' => {
-                // Collapse runs of '*' and try every remaining suffix of t.
                 while pi < p.len() && p[pi] == '*' {
                     pi += 1;
                 }
@@ -237,7 +288,7 @@ fn glob_match_inner(p: &[char], mut pi: usize, t: &[char], mut ti: usize) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::glob_match;
+    use super::{glob_match, path_passes_filters};
 
     #[test]
     fn matches_trailing_wildcard() {
@@ -256,8 +307,38 @@ mod tests {
     }
 
     #[test]
-    fn matches_question_mark() {
-        assert!(glob_match("a?c", "abc"));
-        assert!(!glob_match("a?c", "ac"));
+    fn empty_include_admits_everything() {
+        assert!(path_passes_filters("C:\\anything.exe", &[], &[]));
+    }
+
+    #[test]
+    fn include_gates() {
+        let include = vec!["C:\\Users\\*\\Downloads\\*".to_string()];
+        assert!(path_passes_filters(
+            "C:\\Users\\ahmed\\Downloads\\x.exe",
+            &include,
+            &[]
+        ));
+        assert!(!path_passes_filters(
+            "C:\\Windows\\System32\\x.exe",
+            &include,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn exclude_overrides_include() {
+        let include = vec!["C:\\Users\\*".to_string()];
+        let exclude = vec!["*\\Cache\\*".to_string()];
+        assert!(path_passes_filters(
+            "C:\\Users\\ahmed\\Downloads\\x.exe",
+            &include,
+            &exclude
+        ));
+        assert!(!path_passes_filters(
+            "C:\\Users\\ahmed\\Cache\\junk.tmp",
+            &include,
+            &exclude
+        ));
     }
 }

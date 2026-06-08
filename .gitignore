@@ -31,3 +31,5 @@ agent/ironclaw-state/
 # ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+.claude
+.04-agent-specification.md

@@ -5,6 +5,7 @@ use ironclaw_core::config::Config;
 use ironclaw_core::event::Event;
 use ironclaw_core::identity::{self, validate_role, Identity, RegisterRequest};
 use ironclaw_core::policy::Policy;
+use ironclaw_core::risk;
 use ironclaw_transport::buffer::EventBuffer;
 use ironclaw_transport::http::{HeartbeatRequest, HttpClient};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -526,19 +527,31 @@ impl AgentApp {
         // Event intake loop
         log::info!("Agent running. Listening for events...");
         while let Some(event) = rx.recv().await {
-            // M5: Evaluate detection filters from the live policy
-            let (should_drop, filters_snapshot) = {
+            // M5: Evaluate detection filters from the live policy AND run the
+            // local classifier (§4.5 of the agent specification) under a
+            // single read-lock so we never see a half-applied policy.
+            let (should_drop, invariants_snapshot) = {
                 let pol = self.policy.read().await;
                 let drop = Self::apply_detection_filters(&event, &pol.detection_filters);
-                (drop, pol.detection_filters.len())
+                (drop, pol.invariants.clone())
             };
             if should_drop {
                 continue;
             }
-            let _ = filters_snapshot; // used for debug if needed
 
             let mut ev = event;
             ev.agent_id = self.agent_id.clone();
+            risk::classify(&mut ev, &invariants_snapshot);
+
+            if let Some(violation) = &ev.invariant_violation {
+                log::warn!(
+                    "[invariant] {:?} on event_id={:?} agent={}",
+                    violation,
+                    ev.event_id,
+                    ev.agent_id
+                );
+            }
+
             if let Err(e) = self.buffer.push(ev).await {
                 log::error!("Failed to buffer event: {}", e);
             }

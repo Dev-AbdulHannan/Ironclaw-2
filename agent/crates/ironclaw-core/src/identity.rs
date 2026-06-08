@@ -108,6 +108,9 @@ pub struct RegisterRequest {
     /// Initial role assignment requested by the agent. Backend may override on
     /// first heartbeat via `role_assignment`.
     pub role: String,
+    /// Group/department this agent belongs to (e.g., "hr", "engineering", "finance").
+    /// Not persisted in identity.json - sent only during registration and heartbeat.
+    pub group: String,
 }
 
 /// OS metadata included in the registration request.

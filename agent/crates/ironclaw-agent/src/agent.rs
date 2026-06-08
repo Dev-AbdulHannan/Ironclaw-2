@@ -104,7 +104,14 @@ impl AgentApp {
             os_version,
             agent_version,
             role: config.initial_role.clone(),
+            group: config.group.clone(),
         };
+
+        log::info!(
+            "Registering with backend - role: '{}', group: '{}'",
+            req.role,
+            req.group
+        );
 
         let mut backoff = config.backend.retry_delay_secs;
         let mut retries = 0;
@@ -264,6 +271,7 @@ impl AgentApp {
         let hb_buffer = self.buffer.clone();
         let hb_policy_path = self.config.paths.policy_path.clone();
         let hb_shipped_counter = events_shipped_counter.clone();
+        let hb_config = self.config.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(hb_interval));
             let uptime_start = std::time::Instant::now();
@@ -274,10 +282,19 @@ impl AgentApp {
                 let req = HeartbeatRequest {
                     policy_version: current_pol_ver,
                     role: current_role,
+                    group: hb_config.group.clone(),
                     uptime_secs: uptime_start.elapsed().as_secs(),
                     buffer_depth: hb_buffer.memory_depth().await,
                     events_shipped: hb_shipped_counter.load(Ordering::Relaxed),
                 };
+
+                log::info!(
+                    "Sending heartbeat - role: '{}', group: '{}', policy_version: {}",
+                    req.role,
+                    req.group,
+                    req.policy_version
+                );
+
                 match hb_client.heartbeat(&hb_agent_id, &req).await {
                     Ok(res) => {
                         log::info!(

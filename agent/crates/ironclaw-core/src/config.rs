@@ -15,6 +15,9 @@ pub struct Config {
     /// is persisted in identity.json and the env var is ignored on subsequent
     /// starts (backend remains the authoritative source).
     pub initial_role: String,
+    /// Group/department this agent belongs to (e.g., "hr", "engineering", "finance").
+    /// Sent on every heartbeat and registration. Not persisted in identity.json.
+    pub group: String,
 }
 
 impl Config {
@@ -25,6 +28,7 @@ impl Config {
             paths: PathsConfig::from_env(),
             buffer: BufferConfig::from_env(),
             initial_role: load_initial_role(),
+            group: load_group(),
         }
     }
 }
@@ -45,6 +49,10 @@ fn load_initial_role() -> String {
         },
         Err(_) => default_role(),
     }
+}
+
+fn load_group() -> String {
+    std::env::var("IRONCLAW_GROUP").unwrap_or_else(|_| "default".to_string())
 }
 
 /// Backend connectivity settings.

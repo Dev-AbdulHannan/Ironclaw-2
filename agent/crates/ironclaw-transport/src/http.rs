@@ -152,6 +152,9 @@ pub struct HeartbeatRequest {
     /// Current role of the agent. Sent on every heartbeat so the backend can
     /// detect drift and serve the correct policy.
     pub role: String,
+    /// Group/department this agent belongs to (e.g., "hr", "engineering", "finance").
+    /// Sent on every heartbeat so the backend can serve group-specific policies.
+    pub group: String,
     pub uptime_secs: u64,
     pub buffer_depth: usize,
     pub events_shipped: u64,

@@ -3,7 +3,7 @@ name = "ironclaw-collector"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "IRONCLAW telemetry collectors — Sysmon, Security Log, PowerShell, Simulator"
+description = "IRONCLAW telemetry collectors — Sysmon, Security Log, PowerShell"
 
 [dependencies]
 ironclaw-core = { path = "../ironclaw-core" }
@@ -14,7 +14,6 @@ log = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-rand = { workspace = true }
 async-trait = { workspace = true }
 
 # Windows-only: Event Log APIs

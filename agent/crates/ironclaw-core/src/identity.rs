@@ -35,7 +35,7 @@ pub fn default_role() -> String {
 }
 
 /// Validate a role string. Roles are restricted to ASCII alphanumerics, dash,
-/// and underscore, length 1..=64. This prevents the backend from pushing
+/// underscore, and space, length 1..=64. This prevents the backend from pushing
 /// values that could be misinterpreted in logs, file paths, or future query strings.
 pub fn validate_role(role: &str) -> Result<(), String> {
     if role.is_empty() {
@@ -46,10 +46,10 @@ pub fn validate_role(role: &str) -> Result<(), String> {
     }
     if !role
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ')
     {
         return Err(format!(
-            "role '{}' contains invalid characters (allowed: [A-Za-z0-9_-])",
+            "role '{}' contains invalid characters (allowed: [A-Za-z0-9_ -])",
             role
         ));
     }

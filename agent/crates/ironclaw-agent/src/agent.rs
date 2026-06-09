@@ -252,6 +252,11 @@ impl AgentApp {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let (tx, mut rx) = mpsc::channel::<Event>(1000);
 
+        // Priority channel for invariant-violation events (shipped immediately, never batched).
+        // Capacity 64: invariant events are rare; a small buffer prevents the intake loop
+        // from blocking if the invariant shipper is mid-request.
+        let (priority_tx, mut priority_rx) = mpsc::channel::<Event>(64);
+
         // Shared counter for events shipped (reported in heartbeat)
         let events_shipped_counter = Arc::new(AtomicU64::new(0));
 
@@ -417,6 +422,56 @@ impl AgentApp {
             }
         });
 
+        // Invariant shipper — ships invariant-violation events immediately, one at a time.
+        let inv_client = self.http_client.clone();
+        let inv_agent_id = self.agent_id.clone();
+        tokio::spawn(async move {
+            while let Some(event) = priority_rx.recv().await {
+                log::warn!(
+                    "[invariant-shipper] Immediate ship for invariant={:?} agent={}",
+                    event.invariant_violation,
+                    event.agent_id
+                );
+
+                let compressed = match ironclaw_transport::batch::Batcher::compress_batch(&[event.clone()]) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::error!("[invariant-shipper] Compression failed: {}", e);
+                        continue;
+                    }
+                };
+
+                let mut attempt = 0u32;
+                loop {
+                    match inv_client.ship_events(&inv_agent_id, compressed.clone()).await {
+                        Ok(()) => {
+                            log::warn!(
+                                "[invariant-shipper] Shipped invariant event event_id={:?}",
+                                event.event_id
+                            );
+                            break;
+                        }
+                        Err(e) if attempt < 3 => {
+                            attempt += 1;
+                            log::warn!(
+                                "[invariant-shipper] Ship attempt {} failed: {}. Retrying in 1s...",
+                                attempt,
+                                e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "[invariant-shipper] Failed to ship invariant event after 3 attempts: {}. Dropping.",
+                                e
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         // Start shipper loop — respects rate limit from policy
         let ship_client = self.http_client.clone();
         let ship_agent_id = self.agent_id.clone();
@@ -574,8 +629,15 @@ impl AgentApp {
                 );
             }
 
-            if let Err(e) = self.buffer.push(ev).await {
-                log::error!("Failed to buffer event: {}", e);
+            if ev.invariant_violation.is_some() {
+                // Invariant violations bypass the batch buffer — ship immediately.
+                if let Err(e) = priority_tx.send(ev).await {
+                    log::error!("[intake] Invariant priority channel closed: {}", e);
+                }
+            } else {
+                if let Err(e) = self.buffer.push(ev).await {
+                    log::error!("Failed to buffer event: {}", e);
+                }
             }
         }
 

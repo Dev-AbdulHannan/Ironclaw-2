@@ -465,6 +465,29 @@ mod tests {
     }
 
     #[test]
+    fn invariant_events_have_violation_set() {
+        // Ensure every event that trips an invariant has invariant_violation set
+        // so the intake loop routing condition `ev.invariant_violation.is_some()` works.
+        let mut ev = Event::new(
+            "test-agent",
+            EventType::RemoteThread,
+            "sysmon",
+            Some(8),
+            json!({
+                "SourceImage": "C:\\Users\\ahmed\\Downloads\\loader.exe",
+                "TargetImage": "C:\\Windows\\System32\\notepad.exe"
+            }),
+        );
+        classify(&mut ev, &PolicyInvariants::default());
+        // RemoteThread (Sysmon 8) into a different process → ProcessInjection invariant
+        assert!(
+            ev.invariant_violation.is_some(),
+            "expected ProcessInjection invariant to be set"
+        );
+        assert_eq!(ev.risk_score, 100);
+    }
+
+    #[test]
     fn common_port_not_flagged() {
         let mut ev = Event::new(
             "test-agent",

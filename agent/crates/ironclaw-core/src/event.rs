@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::risk::{InvariantViolation, RiskFlag};
+
 /// Every raw observation collected by the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -13,14 +15,54 @@ pub struct Event {
     pub agent_id: String,
     /// UTC timestamp when the event was observed.
     pub timestamp: DateTime<Utc>,
-    /// Category of the event.
+    /// Semantic event category (canonical name matches Dev B §7.8).
     pub event_type: EventType,
-    /// Source that produced this event (e.g. "sysmon", "security_log", "powershell").
+    /// Source that produced this event ("sysmon", "security_log", "powershell").
     pub source: String,
     /// Sysmon/Security event ID, if applicable.
+    #[serde(rename = "original_event_id", alias = "event_id", skip_serializing_if = "Option::is_none")]
     pub event_id: Option<u32>,
-    /// Free-form payload with all event-specific fields.
+
+    // --- Canonical structured fields (Dev B §7.2) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<UserInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_process: Option<ProcessInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns: Option<DnsInfo>,
+
+    // Raw Sysmon payload — kept internally for risk classifier and watermark
+    // tracking. NOT serialized to the wire format.
+    #[serde(skip)]
     pub payload: serde_json::Value,
+
+    /// Local risk indicators attached by the classifier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risk_flags: Vec<RiskFlag>,
+
+    /// Aggregate score, 0..=100. 0 means "no local concern".
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub risk_score: u8,
+
+    /// Set when the event tripped one of the policy invariants (§4.5.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invariant_violation: Option<InvariantViolation>,
+
+    /// Names of detection filters (from policy) that matched this event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_filters: Vec<String>,
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Event {
@@ -38,31 +80,257 @@ impl Event {
             event_type,
             source: source.to_string(),
             event_id,
+            host: None,
+            user: None,
+            process: None,
+            parent_process: None,
+            file: None,
+            network: None,
+            dns: None,
             payload,
+            risk_flags: Vec::new(),
+            risk_score: 0,
+            invariant_violation: None,
+            matched_filters: Vec::new(),
         }
     }
 }
 
-/// Categories matching the PDF telemetry sources.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Canonical event categories — serialised names match Dev B's §7.8 mapping.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
-    /// Process creation/termination (Sysmon 1, 5)
-    Process,
-    /// Network connection (Sysmon 3)
-    Network,
-    /// DNS query (Sysmon 22)
-    Dns,
-    /// Driver/image load (Sysmon 7)
-    DriverLoad,
-    /// File system event (Sysmon 11/23)
-    FileSystem,
-    /// Authentication event (Security log 4624/4625)
-    Auth,
-    /// PowerShell script block (Event 4104)
-    PowerShell,
-    /// Registry event (Sysmon 12/13)
-    Registry,
-    /// Pipe event (Sysmon 17/18)
-    Pipe,
+    // Sysmon-specific (one variant per Sysmon event ID group)
+    ProcessCreate,        // Sysmon 1
+    ProcessTerminate,     // Sysmon 5
+    NetworkConnect,       // Sysmon 3
+    DnsQuery,             // Sysmon 22
+    FileCreate,           // Sysmon 11
+    FileCreateTime,       // Sysmon 2 (file creation time changed)
+    FileStreamCreate,     // Sysmon 15 (alternate data stream)
+    FileDelete,           // Sysmon 23
+    DriverLoad,           // Sysmon 6
+    ImageLoad,            // Sysmon 7
+    RemoteThread,         // Sysmon 8
+    RawDiskAccess,        // Sysmon 9
+    ProcessAccess,        // Sysmon 10
+    RegistryCreateDelete, // Sysmon 12, 14
+    RegistryValueSet,     // Sysmon 13
+    Pipe,                 // Sysmon 17, 18
+    WmiActivity,          // Sysmon 19, 20, 21
+    ClipboardAccess,      // Sysmon 24
+    // Other sources
+    Auth,                 // Security log 4624/4625
+    PowerShell,           // PowerShell 4104
+}
+
+/// Top-level host context attached to every event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostInfo {
+    pub name: String,
+}
+
+/// Authenticated user associated with the event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+/// Process (or parent process) context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash_sha256: Option<String>,
+}
+
+/// File target context (file-system events).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Network connection context (Sysmon 3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+/// DNS query context (Sysmon 22).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+}
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::*;
+    use crate::risk::RiskFlag;
+
+    #[test]
+    fn event_type_serializes_as_canonical_name() {
+        assert_eq!(serde_json::to_string(&EventType::ProcessCreate).unwrap(), r#""process_create""#);
+        assert_eq!(serde_json::to_string(&EventType::ProcessTerminate).unwrap(), r#""process_terminate""#);
+        assert_eq!(serde_json::to_string(&EventType::NetworkConnect).unwrap(), r#""network_connect""#);
+        assert_eq!(serde_json::to_string(&EventType::DnsQuery).unwrap(), r#""dns_query""#);
+        assert_eq!(serde_json::to_string(&EventType::FileCreate).unwrap(), r#""file_create""#);
+        assert_eq!(serde_json::to_string(&EventType::RegistryCreateDelete).unwrap(), r#""registry_create_delete""#);
+        assert_eq!(serde_json::to_string(&EventType::RegistryValueSet).unwrap(), r#""registry_value_set""#);
+    }
+
+    #[test]
+    fn canonical_fields_serialized_payload_skipped() {
+        let mut ev = Event::new(
+            "agent-1",
+            EventType::ProcessCreate,
+            "sysmon",
+            Some(1),
+            serde_json::json!({ "Image": "C:\\Windows\\notepad.exe", "CommandLine": "notepad.exe" }),
+        );
+        ev.host = Some(HostInfo { name: "IronClaw".into() });
+        ev.process = Some(ProcessInfo {
+            pid: Some(1234),
+            name: Some("notepad.exe".into()),
+            path: Some("C:\\Windows\\notepad.exe".into()),
+            command_line: Some("notepad.exe".into()),
+            hash_sha256: None,
+        });
+
+        let wire = serde_json::to_value(&ev).unwrap();
+
+        assert_eq!(wire["event_type"], "process_create");
+        assert_eq!(wire["host"]["name"], "IronClaw");
+        assert_eq!(wire["process"]["pid"], 1234);
+        assert_eq!(wire["process"]["name"], "notepad.exe");
+        assert!(wire.get("payload").is_none(), "payload must be absent from wire format");
+    }
+
+    #[test]
+    fn process_create_wire_shape_matches_dev_b_spec() {
+        let mut ev = Event::new(
+            "c1eefb9f-50f2-444d-8a8a-1a1114286af6",
+            EventType::ProcessCreate,
+            "sysmon",
+            Some(1),
+            serde_json::json!({
+                "Image": "C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\ngentask.exe",
+                "CommandLine": "\"NGenTask.exe\" /StopEvent:1436",
+                "ProcessId": "3492",
+            }),
+        );
+        ev.host = Some(HostInfo { name: "IronClaw".into() });
+        ev.user = Some(UserInfo { name: "ahmad".into(), domain: Some("IronClaw".into()) });
+        ev.process = Some(ProcessInfo {
+            pid: Some(3492),
+            name: Some("ngentask.exe".into()),
+            path: Some("C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\ngentask.exe".into()),
+            command_line: Some("\"NGenTask.exe\" /StopEvent:1436".into()),
+            hash_sha256: Some("045008D154DD7BBC250F4975C87559378C834388790F62B05D5457E224FBF85B".into()),
+        });
+        ev.parent_process = Some(ProcessInfo {
+            pid: Some(8264),
+            name: Some("ngentask.exe".into()),
+            path: Some("C:\\Windows\\Microsoft.NET\\Framework\\v4.0.30319\\ngentask.exe".into()),
+            command_line: None,
+            hash_sha256: None,
+        });
+        ev.risk_flags = vec![RiskFlag::PathNotStandard];
+        ev.risk_score = 15;
+
+        let wire = serde_json::to_value(&ev).unwrap();
+
+        assert_eq!(wire["event_type"], "process_create");
+        assert_eq!(wire["source"], "sysmon");
+        assert_eq!(wire["original_event_id"], 1);
+        assert_eq!(wire["host"]["name"], "IronClaw");
+        assert_eq!(wire["user"]["name"], "ahmad");
+        assert_eq!(wire["user"]["domain"], "IronClaw");
+        assert_eq!(wire["process"]["pid"], 3492);
+        assert_eq!(wire["process"]["name"], "ngentask.exe");
+        assert_eq!(wire["process"]["hash_sha256"], "045008D154DD7BBC250F4975C87559378C834388790F62B05D5457E224FBF85B");
+        assert_eq!(wire["parent_process"]["pid"], 8264);
+        assert_eq!(wire["risk_flags"][0], "path_not_standard");
+        assert_eq!(wire["risk_score"], 15);
+        assert!(wire.get("payload").is_none());
+    }
+
+    #[test]
+    fn network_connect_wire_shape() {
+        let mut ev = Event::new(
+            "agent-1",
+            EventType::NetworkConnect,
+            "sysmon",
+            Some(3),
+            serde_json::json!({}),
+        );
+        ev.host = Some(HostInfo { name: "IronClaw".into() });
+        ev.process = Some(ProcessInfo {
+            pid: Some(7644),
+            name: Some("msedge.exe".into()),
+            path: Some("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe".into()),
+            command_line: None,
+            hash_sha256: None,
+        });
+        ev.network = Some(NetworkInfo {
+            src_ip: Some("10.0.0.5".into()),
+            src_port: Some(49152),
+            dst_ip: Some("142.250.80.0".into()),
+            dst_port: Some(443),
+            protocol: Some("tcp".into()),
+        });
+
+        let wire = serde_json::to_value(&ev).unwrap();
+
+        assert_eq!(wire["event_type"], "network_connect");
+        assert_eq!(wire["network"]["dst_ip"], "142.250.80.0");
+        assert_eq!(wire["network"]["dst_port"], 443);
+        assert_eq!(wire["network"]["src_port"], 49152);
+        assert!(wire.get("file").is_none());
+        assert!(wire.get("dns").is_none());
+        assert!(wire.get("payload").is_none());
+    }
+
+    #[test]
+    fn omitted_fields_absent_from_wire() {
+        let ev = Event::new("a", EventType::Auth, "security_log", None, serde_json::json!({}));
+        let wire = serde_json::to_value(&ev).unwrap();
+
+        // Optional fields not set must be absent (not "null")
+        assert!(wire.get("original_event_id").is_none());
+        assert!(wire.get("host").is_none());
+        assert!(wire.get("user").is_none());
+        assert!(wire.get("process").is_none());
+        assert!(wire.get("file").is_none());
+        assert!(wire.get("network").is_none());
+        assert!(wire.get("dns").is_none());
+        assert!(wire.get("risk_flags").is_none());
+        assert!(wire.get("risk_score").is_none());
+        assert!(wire.get("payload").is_none());
+    }
 }

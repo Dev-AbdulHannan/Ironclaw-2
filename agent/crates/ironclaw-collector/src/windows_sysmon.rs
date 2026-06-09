@@ -111,7 +111,7 @@ impl Collector for SysmonCollector {
                 Ok(Ok(xml_events)) => {
                     has_warned = false; // Reset warning state on success
                     if !xml_events.is_empty() {
-                        log::debug!("[sysmon] Found {} raw Sysmon XML events", xml_events.len());
+                        log::info!("[sysmon] Found {} new Sysmon events to process", xml_events.len());
                     }
                     for xml in xml_events {
                         let Some(event) =
@@ -130,50 +130,47 @@ impl Collector for SysmonCollector {
                         // Filter by the EventIDs enabled in the active policy.
                         if let Some(eid) = event.event_id {
                             if !active_ids_clone.contains(&eid) {
-                                log::debug!("[sysmon] event ID={} skipped by policy", eid);
+                                log::info!(
+                                    "[sysmon] event ID={} record_id={:?} DROPPED (not in policy sysmon_events list)",
+                                    eid, rec_id
+                                );
                                 advance_watermark(rec_id, &mut last_record_id);
                                 continue;
                             }
 
                             // File-event path filtering.
-                            if FILE_EVENT_IDS.contains(&eid)
-                                && !path_passes_filters(
-                                    extract_file_path(&event),
-                                    &file_include,
-                                    &file_exclude,
-                                )
-                            {
-                                log::debug!(
-                                    "[sysmon] file event ID={} skipped by file_events filters",
-                                    eid
-                                );
-                                advance_watermark(rec_id, &mut last_record_id);
-                                continue;
+                            if FILE_EVENT_IDS.contains(&eid) {
+                                let path = extract_file_path(&event);
+                                if !path_passes_filters(path, &file_include, &file_exclude) {
+                                    log::info!(
+                                        "[sysmon] event ID={} record_id={:?} DROPPED (file path '{}' blocked by file_events filters)",
+                                        eid, rec_id, path
+                                    );
+                                    advance_watermark(rec_id, &mut last_record_id);
+                                    continue;
+                                }
                             }
 
                             // Registry path filtering.
-                            if REGISTRY_EVENT_IDS.contains(&eid)
-                                && !path_passes_filters(
-                                    extract_registry_path(&event),
-                                    &reg_include,
-                                    &reg_exclude,
-                                )
-                            {
-                                log::debug!(
-                                    "[sysmon] registry event ID={} skipped by registry_keys filters",
-                                    eid
-                                );
-                                advance_watermark(rec_id, &mut last_record_id);
-                                continue;
+                            if REGISTRY_EVENT_IDS.contains(&eid) {
+                                let path = extract_registry_path(&event);
+                                if !path_passes_filters(path, &reg_include, &reg_exclude) {
+                                    log::info!(
+                                        "[sysmon] event ID={} record_id={:?} DROPPED (registry path '{}' blocked by registry_keys filters)",
+                                        eid, rec_id, path
+                                    );
+                                    advance_watermark(rec_id, &mut last_record_id);
+                                    continue;
+                                }
                             }
+
+                            log::info!(
+                                "[sysmon] event ID={} type={:?} record_id={:?} ACCEPTED -> sending to intake",
+                                eid, event.event_type, rec_id
+                            );
                         }
 
                         advance_watermark(rec_id, &mut last_record_id);
-                        log::debug!(
-                            "[sysmon] event ID={:?} record_id={:?} -> agent channel",
-                            event.event_id,
-                            rec_id
-                        );
                         if let Err(e) = tx.send(event).await {
                             log::warn!("[sysmon] Event channel closed: {}", e);
                             return Ok(());

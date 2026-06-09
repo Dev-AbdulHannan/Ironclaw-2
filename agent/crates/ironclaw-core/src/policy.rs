@@ -168,16 +168,21 @@ impl Default for PolicyCollection {
         Self {
             // Sysmon event IDs aligned with §4.2.2 of the agent specification.
             // Excludes ID 24 (Clipboard) per spec — privacy-restricted.
+            // ID 14 (RegistryKeyRename) added alongside 12/13 for full registry coverage.
             sysmon_events: vec![
-                1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 25, 26,
+                1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 25, 26,
             ],
             // Security event IDs aligned with §4.2.3 of the agent specification.
             security_events: vec![
                 4624, 4625, 4634, 4648, 4656, 4657, 4663, 4672, 4688, 4697, 4698, 4720, 4732,
             ],
             powershell_logging: true,
-            dll_events_enabled: false,
-            file_events: FileEventsConfig::default(),
+            dll_events_enabled: true,
+            file_events: FileEventsConfig {
+                enabled: true,
+                path_filters: vec![],
+                exclude: vec![],
+            },
             registry_keys: RegistryKeysConfig::default(),
         }
     }
@@ -206,12 +211,8 @@ impl Default for FileEventsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            path_filters: vec![
-                "C:\\Users\\*\\Downloads\\*".to_string(),
-                "C:\\Users\\*\\AppData\\*".to_string(),
-                "C:\\Windows\\Temp\\*".to_string(),
-            ],
-            exclude: vec!["C:\\Windows\\Prefetch\\*".to_string()],
+            path_filters: vec![],
+            exclude: vec![],
         }
     }
 }

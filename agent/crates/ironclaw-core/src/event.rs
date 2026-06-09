@@ -41,6 +41,11 @@ pub struct Event {
     /// Set when the event tripped one of the policy invariants (§4.5.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invariant_violation: Option<InvariantViolation>,
+
+    /// Names of detection filters (from policy) that matched this event.
+    /// Populated when a filter's action is "flag". Empty when no filter matched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_filters: Vec<String>,
 }
 
 fn is_zero_u8(v: &u8) -> bool {
@@ -66,6 +71,7 @@ impl Event {
             risk_flags: Vec::new(),
             risk_score: 0,
             invariant_violation: None,
+            matched_filters: Vec::new(),
         }
     }
 }

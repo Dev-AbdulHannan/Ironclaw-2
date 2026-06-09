@@ -196,11 +196,17 @@ impl AgentApp {
     }
 
     /// Evaluate detection filters from the policy against an event.
-    /// Returns true if the event should be DROPPED (matched a "block" action).
+    ///
+    /// Returns `(should_drop, matched_filter_names)`:
+    /// - `should_drop = true` means the event matched a "block" filter and must be discarded.
+    /// - `matched_filter_names` contains the names of every "flag" filter that matched;
+    ///   callers should attach these to `event.matched_filters` before buffering.
     fn apply_detection_filters(
         event: &Event,
         filters: &[ironclaw_core::policy::DetectionFilter],
-    ) -> bool {
+    ) -> (bool, Vec<String>) {
+        let mut matched: Vec<String> = Vec::new();
+
         for filter in filters {
             let field_value = match filter.match_field.as_str() {
                 "cmdline" | "CommandLine" => event
@@ -226,20 +232,21 @@ impl AgentApp {
                             "[detection] Filter '{}' matched: field='{}' pattern='{}' on event_id={:?}",
                             filter.name, filter.match_field, filter.pattern, event.event_id
                         );
-                        // "flag" = log and continue, don't drop
+                        matched.push(filter.name.clone());
                     }
                     "block" => {
                         log::warn!(
                             "[detection] Filter '{}' BLOCKED event: field='{}' pattern='{}' on event_id={:?}",
                             filter.name, filter.match_field, filter.pattern, event.event_id
                         );
-                        return true; // drop the event
+                        return (true, vec![]);
                     }
                     _ => {}
                 }
             }
         }
-        false
+
+        (false, matched)
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -462,6 +469,20 @@ impl AgentApp {
                         tokens -= to_ship.len() as f64;
 
                         let count = to_ship.len();
+
+                        // Log every event ID in the batch so we can prove to
+                        // the backend exactly what was shipped.
+                        let mut id_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                        for e in &to_ship {
+                            let key = format!(
+                                "{}(id={:?})",
+                                e.source,
+                                e.event_id
+                            );
+                            *id_counts.entry(key).or_insert(0) += 1;
+                        }
+                        log::info!("[shipper] Sending batch of {} events: {:?}", count, id_counts);
+
                         match ironclaw_transport::batch::Batcher::compress_batch(&to_ship) {
                             Ok(compressed) => {
                                 if let Err(e) =
@@ -527,13 +548,13 @@ impl AgentApp {
         // Event intake loop
         log::info!("Agent running. Listening for events...");
         while let Some(event) = rx.recv().await {
-            // M5: Evaluate detection filters from the live policy AND run the
+            // Evaluate detection filters from the live policy AND run the
             // local classifier (§4.5 of the agent specification) under a
             // single read-lock so we never see a half-applied policy.
-            let (should_drop, invariants_snapshot) = {
+            let (should_drop, matched_filters, invariants_snapshot) = {
                 let pol = self.policy.read().await;
-                let drop = Self::apply_detection_filters(&event, &pol.detection_filters);
-                (drop, pol.invariants.clone())
+                let (drop, filters) = Self::apply_detection_filters(&event, &pol.detection_filters);
+                (drop, filters, pol.invariants.clone())
             };
             if should_drop {
                 continue;
@@ -541,6 +562,7 @@ impl AgentApp {
 
             let mut ev = event;
             ev.agent_id = self.agent_id.clone();
+            ev.matched_filters = matched_filters;
             risk::classify(&mut ev, &invariants_snapshot);
 
             if let Some(violation) = &ev.invariant_violation {

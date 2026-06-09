@@ -142,7 +142,7 @@ fn detect_risk_flags(event: &Event, flags: &mut Vec<RiskFlag>) {
     }
 
     // --- Network-connection signals (Sysmon ID 3)
-    if event.event_type == EventType::Network {
+    if event.event_type == EventType::NetworkConnect {
         if let Some(port) = payload_u64(payload, "DestinationPort") {
             if is_rare_port(port as u16) {
                 flags.push(RiskFlag::RarePort);
@@ -355,7 +355,7 @@ mod tests {
     use serde_json::json;
 
     fn proc_event(payload: serde_json::Value) -> Event {
-        Event::new("test-agent", EventType::Process, "sysmon", Some(1), payload)
+        Event::new("test-agent", EventType::ProcessCreate, "sysmon", Some(1), payload)
     }
 
     #[test]
@@ -452,7 +452,7 @@ mod tests {
     fn rare_port_flagged() {
         let mut ev = Event::new(
             "test-agent",
-            EventType::Network,
+            EventType::NetworkConnect,
             "sysmon",
             Some(3),
             json!({
@@ -468,7 +468,7 @@ mod tests {
     fn common_port_not_flagged() {
         let mut ev = Event::new(
             "test-agent",
-            EventType::Network,
+            EventType::NetworkConnect,
             "sysmon",
             Some(3),
             json!({

@@ -1,11 +1,46 @@
 #![cfg(windows)]
 
-use ironclaw_core::event::{Event, EventType};
+use ironclaw_core::event::{
+    DnsInfo, Event, EventType, FileInfo, HostInfo, NetworkInfo, ProcessInfo, UserInfo,
+};
 use windows::core::PCWSTR;
 use windows::Win32::System::EventLog::*;
 
 pub fn to_utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Return the last path component of a Windows path (after the last `\`).
+fn win_basename(path: &str) -> String {
+    path.rsplit('\\').next().unwrap_or(path).to_string()
+}
+
+/// Return `Some(value)` when the field exists and is non-empty, else `None`.
+fn opt_str(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    map.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Parse a port number from a JSON value that may be a string or integer.
+fn opt_port(map: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<u16> {
+    map.get(key).and_then(|v| {
+        v.as_u64()
+            .map(|n| n as u16)
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u16>().ok()))
+    })
+}
+
+/// Extract the hex SHA-256 digest from a Sysmon `Hashes` field.
+/// Sysmon format: "SHA256=<hex>" or "MD5=<md5>,SHA256=<hex>,..."
+fn extract_sha256(hashes: &str) -> Option<String> {
+    hashes.split(',').find_map(|pair| {
+        let pair = pair.trim();
+        pair.strip_prefix("SHA256=")
+            .or_else(|| pair.strip_prefix("sha256="))
+            .map(|h| h.to_string())
+    })
 }
 
 pub fn parse_event_xml(
@@ -83,34 +118,162 @@ pub fn parse_event_xml(
         serde_json::Value::String(timestamp),
     );
 
-    // Determine specific EventType overrides
+    // Map Sysmon event IDs to canonical EventType variants (Dev B §7.8).
     let mut etype = default_type;
     if source == "sysmon" {
         etype = match event_id {
-            1 | 5 => EventType::Process,
-            2 | 11 | 15 | 23 => EventType::FileSystem,
-            3 => EventType::Network,
+            1 => EventType::ProcessCreate,
+            2 => EventType::FileCreateTime,
+            3 => EventType::NetworkConnect,
+            5 => EventType::ProcessTerminate,
             6 => EventType::DriverLoad,
             7 => EventType::ImageLoad,
             8 => EventType::RemoteThread,
             9 => EventType::RawDiskAccess,
             10 => EventType::ProcessAccess,
-            12 | 13 => EventType::Registry,
+            11 => EventType::FileCreate,
+            12 => EventType::RegistryCreateDelete,
+            13 => EventType::RegistryValueSet,
+            14 => EventType::RegistryCreateDelete,
+            15 => EventType::FileStreamCreate,
             17 | 18 => EventType::Pipe,
             19 | 20 | 21 => EventType::WmiActivity,
-            22 => EventType::Dns,
+            22 => EventType::DnsQuery,
+            23 => EventType::FileDelete,
             24 => EventType::ClipboardAccess,
             _ => default_type,
         };
     }
 
-    Some(Event::new(
+    // Build canonical structured fields (§7.9 mapping).
+    let host = opt_str(&payload, "computer").map(|name| HostInfo { name });
+
+    let user = opt_str(&payload, "User").map(|raw| {
+        if let Some(idx) = raw.find('\\') {
+            UserInfo {
+                domain: Some(raw[..idx].to_string()),
+                name: raw[idx + 1..].to_string(),
+            }
+        } else {
+            UserInfo { name: raw, domain: None }
+        }
+    });
+
+    let (process, parent_process, file, network, dns) = match event_id {
+        // ProcessCreate (1): process + parent_process
+        1 => {
+            let proc_info = Some(ProcessInfo {
+                pid: opt_str(&payload, "ProcessId").and_then(|s| s.parse().ok()),
+                name: opt_str(&payload, "Image").map(|p| win_basename(&p)),
+                path: opt_str(&payload, "Image"),
+                command_line: opt_str(&payload, "CommandLine"),
+                hash_sha256: payload
+                    .get("Hashes")
+                    .and_then(|v| v.as_str())
+                    .and_then(|h| extract_sha256(h)),
+            });
+            let parent = Some(ProcessInfo {
+                pid: opt_str(&payload, "ParentProcessId").and_then(|s| s.parse().ok()),
+                name: opt_str(&payload, "ParentImage").map(|p| win_basename(&p)),
+                path: opt_str(&payload, "ParentImage"),
+                command_line: opt_str(&payload, "ParentCommandLine"),
+                hash_sha256: None,
+            });
+            (proc_info, parent, None, None, None)
+        }
+        // ProcessTerminate (5): process only
+        5 => {
+            let proc_info = Some(ProcessInfo {
+                pid: opt_str(&payload, "ProcessId").and_then(|s| s.parse().ok()),
+                name: opt_str(&payload, "Image").map(|p| win_basename(&p)),
+                path: opt_str(&payload, "Image"),
+                command_line: None,
+                hash_sha256: None,
+            });
+            (proc_info, None, None, None, None)
+        }
+        // NetworkConnect (3): process + network
+        3 => {
+            let proc_info = Some(ProcessInfo {
+                pid: opt_str(&payload, "ProcessId").and_then(|s| s.parse().ok()),
+                name: opt_str(&payload, "Image").map(|p| win_basename(&p)),
+                path: opt_str(&payload, "Image"),
+                command_line: None,
+                hash_sha256: None,
+            });
+            let net = Some(NetworkInfo {
+                src_ip: opt_str(&payload, "SourceIp"),
+                src_port: opt_port(&payload, "SourcePort"),
+                dst_ip: opt_str(&payload, "DestinationIp"),
+                dst_port: opt_port(&payload, "DestinationPort"),
+                protocol: opt_str(&payload, "Protocol"),
+            });
+            (proc_info, None, None, net, None)
+        }
+        // DnsQuery (22): process + dns
+        22 => {
+            let proc_info = Some(ProcessInfo {
+                pid: opt_str(&payload, "ProcessId").and_then(|s| s.parse().ok()),
+                name: opt_str(&payload, "Image").map(|p| win_basename(&p)),
+                path: opt_str(&payload, "Image"),
+                command_line: None,
+                hash_sha256: None,
+            });
+            let dns_info = Some(DnsInfo {
+                query: opt_str(&payload, "QueryName"),
+                query_type: opt_str(&payload, "QueryType"),
+                response: opt_str(&payload, "QueryResults"),
+            });
+            (proc_info, None, None, None, dns_info)
+        }
+        // File events (2, 11, 15, 23): process + file
+        2 | 11 | 15 | 23 => {
+            let proc_info = Some(ProcessInfo {
+                pid: opt_str(&payload, "ProcessId").and_then(|s| s.parse().ok()),
+                name: opt_str(&payload, "Image").map(|p| win_basename(&p)),
+                path: opt_str(&payload, "Image"),
+                command_line: None,
+                hash_sha256: None,
+            });
+            let file_path = opt_str(&payload, "TargetFilename");
+            let file_info = Some(FileInfo {
+                name: file_path.as_deref().map(win_basename),
+                path: file_path,
+            });
+            (proc_info, None, file_info, None, None)
+        }
+        // All other IDs: extract process fields where available
+        _ => {
+            let proc_info = if opt_str(&payload, "Image").is_some() {
+                Some(ProcessInfo {
+                    pid: opt_str(&payload, "ProcessId").and_then(|s| s.parse().ok()),
+                    name: opt_str(&payload, "Image").map(|p| win_basename(&p)),
+                    path: opt_str(&payload, "Image"),
+                    command_line: opt_str(&payload, "CommandLine"),
+                    hash_sha256: None,
+                })
+            } else {
+                None
+            };
+            (proc_info, None, None, None, None)
+        }
+    };
+
+    let mut event = Event::new(
         agent_id,
         etype,
         source,
         Some(event_id),
         serde_json::Value::Object(payload),
-    ))
+    );
+    event.host = host;
+    event.user = user;
+    event.process = process;
+    event.parent_process = parent_process;
+    event.file = file;
+    event.network = network;
+    event.dns = dns;
+    Some(event)
 }
 
 pub unsafe fn query_new_events(channel: &str, xpath_query: &str) -> anyhow::Result<Vec<String>> {

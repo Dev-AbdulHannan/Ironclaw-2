@@ -115,7 +115,7 @@ impl Collector for SysmonCollector {
                     }
                     for xml in xml_events {
                         let Some(event) =
-                            parse_event_xml(&xml, "windows-agent", EventType::Process, "sysmon")
+                            parse_event_xml(&xml, "windows-agent", EventType::ProcessCreate, "sysmon")
                         else {
                             log::debug!("[sysmon] Failed to parse XML as Sysmon event");
                             continue;
